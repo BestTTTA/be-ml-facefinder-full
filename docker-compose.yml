@@ -1,0 +1,85 @@
+services:
+  api:
+    build: .
+    container_name: facefinder-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - ${API_ENV_FILE:-.env}   # API_ENV_FILE=path to use another env file
+    environment:
+      # in-network addresses always win over .env (which targets the host)
+      DATABASE_URL: postgresql://${POSTGRES_USER:-facefinder}:${POSTGRES_PASSWORD:-facefinder}@postgres:5432/${POSTGRES_DB:-facefinder}
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_SSL: "false"
+      APP_ENV: ${APP_ENV:-production}
+      FACE_CTX_ID: ${FACE_CTX_ID:--1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    volumes:
+      - insightface-models:/root/.insightface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health/live').status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: facefinder-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-facefinder}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-facefinder}
+      POSTGRES_DB: ${POSTGRES_DB:-facefinder}
+    ports:
+      - "${POSTGRES_PORT:-5555}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-facefinder} -d ${POSTGRES_DB:-facefinder}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: facefinder-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:RELEASE.2023-12-07T04-16-00Z.fips
+    container_name: facefinder-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    ports:
+      - "${MINIO_PORT:-9100}:9000"
+      - "${MINIO_CONSOLE_PORT:-9101}:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - minio-data:/data
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+  insightface-models:

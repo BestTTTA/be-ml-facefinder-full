@@ -1,0 +1,28 @@
+# --- API platform ---
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30
+pydantic>=2.7
+pydantic-settings>=2.3
+python-multipart>=0.0.9
+sqlalchemy[asyncio]>=2.0.30
+asyncpg>=0.29
+alembic>=1.13
+pgvector>=0.3
+redis>=5.0
+pyjwt[crypto]>=2.8
+argon2-cffi>=23.1
+httpx>=0.27
+minio>=7.2
+python-dotenv>=1.0
+
+# --- face engine ---
+insightface>=0.7.3
+onnxruntime>=1.17
+opencv-python-headless>=4.9
+numpy>=1.26,<3
+pillow>=10.3
+
+# --- legacy Facemenow app (main.py, optional; LEGACY_API_ENABLED=true) ---
+stripe>=8.0
+requests>=2.31
+tqdm>=4.66
