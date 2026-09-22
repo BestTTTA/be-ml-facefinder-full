@@ -6,19 +6,47 @@ on:
       - main
 
 env:
-  DOCKER_IMAGE: ${{ secrets.DOCKER_IMAGE }}
-  DEPLOY_SERVER: ${{ secrets.DEPLOY_SERVER }}
-  DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+  IMAGE_REPO: ${{ secrets.DOCKER_IMAGE }}   # e.g. user/facemenow — the tag is added per build
 
 jobs:
+  # A broken commit must never reach the server, so the build waits on the suite.
+  test:
+    name: Lint, type-check, test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: facefinder
+          POSTGRES_PASSWORD: facefinder
+          POSTGRES_DB: facefinder_test
+        ports: ["5555:5432"]
+        options: >-
+          --health-cmd "pg_isready -U facefinder" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install (no face model needed — tests use FACE_ENGINE=fake)
+        run: |
+          python -m pip install --upgrade pip
+          pip install "fastapi>=0.115" "uvicorn[standard]" "sqlalchemy[asyncio]>=2.0" asyncpg alembic \
+            pgvector "redis>=5" "pyjwt[crypto]" httpx argon2-cffi python-multipart pydantic-settings pillow numpy minio \
+            pytest pytest-asyncio fakeredis ruff mypy
+      - run: ruff check app tests migrations/env.py
+      - run: mypy -p app
+      - run: pytest -q
+        env:
+          TEST_DATABASE_URL: postgresql://facefinder:facefinder@localhost:5555/facefinder_test
+
   build_and_push:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
-
+    needs: test
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
@@ -26,38 +54,67 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Build Docker image
-        run: docker build -t $DOCKER_IMAGE .
-
-      - name: Push Docker image to Docker Hub
-        run: docker push $DOCKER_IMAGE
+      # Tagging by commit is what makes a rollback to an exact earlier build possible.
+      - name: Build and push
+        run: |
+          docker build -t "$IMAGE_REPO:$GITHUB_SHA" -t "$IMAGE_REPO:latest" .
+          docker push "$IMAGE_REPO:$GITHUB_SHA"
+          docker push "$IMAGE_REPO:latest"
 
   deploy:
     name: Deploy to Server
     runs-on: ubuntu-latest
     needs: build_and_push
-
     steps:
+      # Catch the settings that make the container die on boot before touching the server.
+      - name: Check required secrets
+        env:
+          ADMIN_JWT_SECRET: ${{ secrets.ADMIN_JWT_SECRET }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          CORS_ORIGINS: ${{ secrets.CORS_ORIGINS }}
+        run: |
+          fail=0
+          for name in ADMIN_JWT_SECRET DATABASE_URL REDIS_URL CORS_ORIGINS; do
+            eval "value=\$$name"
+            if [ -z "$value" ]; then
+              echo "::error::missing required secret $name"
+              fail=1
+            fi
+          done
+          # APP_ENV is production below, and the app refuses to boot on the placeholder secret.
+          if [ "$ADMIN_JWT_SECRET" = "change-me-in-production" ]; then
+            echo "::error::ADMIN_JWT_SECRET is still the placeholder value"
+            fail=1
+          fi
+          if [ "$CORS_ORIGINS" = "*" ]; then
+            echo "::error::CORS_ORIGINS=* turns off allow_credentials; set the real origins"
+            fail=1
+          fi
+          exit $fail
+
       - name: Install sshpass
         run: sudo apt-get update && sudo apt-get install -y sshpass
 
       - name: Deploy Server
         env:
+          DEPLOY_SERVER: ${{ secrets.DEPLOY_SERVER }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           MINIO_ENDPOINT: ${{ secrets.MINIO_ENDPOINT }}
           MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
           MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
-          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
-          STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET }}
-          BUCKKET_NAME: ${{ secrets.BUCKKET_NAME }}
           MINIO_SSL: ${{ secrets.MINIO_SSL }}
           MINIO_PUBLIC_URL: ${{ secrets.MINIO_PUBLIC_URL }}
-          # --- SaaS platform (app.main) ---
+          BUCKKET_NAME: ${{ secrets.BUCKKET_NAME }}
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+          STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET }}
           REDIS_URL: ${{ secrets.REDIS_URL }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # Leave this secret unset for ES256/RS256 Supabase projects: empty selects JWKS verification.
           SUPABASE_JWT_SECRET: ${{ secrets.SUPABASE_JWT_SECRET }}
           ADMIN_JWT_SECRET: ${{ secrets.ADMIN_JWT_SECRET }}
           ADMIN_BOOTSTRAP_USERNAME: ${{ secrets.ADMIN_BOOTSTRAP_USERNAME }}
@@ -68,37 +125,85 @@ jobs:
           FACE_SIMILARITY_THRESHOLD: ${{ secrets.FACE_SIMILARITY_THRESHOLD }}
           LEGACY_API_ENABLED: ${{ secrets.LEGACY_API_ENABLED }}
         run: |
-          export SSHPASS=$DEPLOY_PASSWORD
-          sshpass -e ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$DEPLOY_SERVER "
-            docker pull \"$DOCKER_IMAGE\"
+          set -eu
+          export SSHPASS="$DEPLOY_PASSWORD"
+          IMAGE="$IMAGE_REPO:$GITHUB_SHA"
 
-            if [ \"\$(docker ps -q -f name=be-facemenow)\" ]; then docker stop be-facemenow; fi
-            if [ \"\$(docker ps -aq -f name=be-facemenow)\" ]; then docker rm be-facemenow; fi
+          # The remote script is generated here so every value is quoted exactly once,
+          # then piped to a plain `sh` on the server.
+          {
+            echo "set -e"
+            echo "IMAGE=$(printf '%q' "$IMAGE")"
+            for name in DATABASE_URL MINIO_ENDPOINT MINIO_ACCESS_KEY MINIO_SECRET_KEY MINIO_SSL \
+                        MINIO_PUBLIC_URL BUCKKET_NAME STRIPE_SECRET_KEY STRIPE_WEBHOOK_SECRET \
+                        REDIS_URL SUPABASE_URL SUPABASE_ANON_KEY SUPABASE_SERVICE_ROLE_KEY \
+                        SUPABASE_JWT_SECRET ADMIN_JWT_SECRET ADMIN_BOOTSTRAP_USERNAME \
+                        ADMIN_BOOTSTRAP_PASSWORD STORAGE_BACKEND STORAGE_BUCKET CORS_ORIGINS \
+                        FACE_SIMILARITY_THRESHOLD LEGACY_API_ENABLED; do
+              eval "value=\${$name:-}"
+              echo "$name=$(printf '%q' "$value")"
+            done
+            cat <<'REMOTE'
+          docker pull "$IMAGE"
 
-            docker run -d -p 7777:8000 \
-              --env DATABASE_URL=${DATABASE_URL} \
-              --env MINIO_ENDPOINT=${MINIO_ENDPOINT} \
-              --env MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY} \
-              --env MINIO_SECRET_KEY=${MINIO_SECRET_KEY} \
-              --env MINIO_SSL=${MINIO_SSL} \
-              --env MINIO_PUBLIC_URL=${MINIO_PUBLIC_URL} \
-              --env BUCKKET_NAME=${BUCKKET_NAME} \
-              --env STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY} \
-              --env STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET} \
-              --env APP_ENV=production \
-              --env REDIS_URL=${REDIS_URL} \
-              --env SUPABASE_URL=${SUPABASE_URL} \
-              --env SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY} \
-              --env SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY} \
-              --env SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET} \
-              --env ADMIN_JWT_SECRET=${ADMIN_JWT_SECRET} \
-              --env ADMIN_BOOTSTRAP_USERNAME=${ADMIN_BOOTSTRAP_USERNAME} \
-              --env ADMIN_BOOTSTRAP_PASSWORD=${ADMIN_BOOTSTRAP_PASSWORD} \
-              --env STORAGE_BACKEND=${STORAGE_BACKEND:-minio} \
-              --env STORAGE_BUCKET=${STORAGE_BUCKET:-faces} \
-              --env CORS_ORIGINS=${CORS_ORIGINS:-*} \
-              --env FACE_SIMILARITY_THRESHOLD=${FACE_SIMILARITY_THRESHOLD:-0.45} \
-              --env LEGACY_API_ENABLED=${LEGACY_API_ENABLED:-false} \
-              --restart unless-stopped \
-              --name be-facemenow \"$DOCKER_IMAGE\"
-          "
+          # Park the current container rather than deleting it, so a failed release can be restored.
+          if [ -n "$(docker ps -aq -f name=^be-facemenow$)" ]; then
+            docker rm -f be-facemenow-prev 2>/dev/null || true
+            docker stop be-facemenow || true
+            docker rename be-facemenow be-facemenow-prev
+          fi
+
+          docker run -d -p 7777:8000 \
+            --env DATABASE_URL="$DATABASE_URL" \
+            --env MINIO_ENDPOINT="$MINIO_ENDPOINT" \
+            --env MINIO_ACCESS_KEY="$MINIO_ACCESS_KEY" \
+            --env MINIO_SECRET_KEY="$MINIO_SECRET_KEY" \
+            --env MINIO_SSL="$MINIO_SSL" \
+            --env MINIO_PUBLIC_URL="$MINIO_PUBLIC_URL" \
+            --env BUCKKET_NAME="$BUCKKET_NAME" \
+            --env STRIPE_SECRET_KEY="$STRIPE_SECRET_KEY" \
+            --env STRIPE_WEBHOOK_SECRET="$STRIPE_WEBHOOK_SECRET" \
+            --env APP_ENV=production \
+            --env REDIS_URL="$REDIS_URL" \
+            --env SUPABASE_URL="$SUPABASE_URL" \
+            --env SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY" \
+            --env SUPABASE_SERVICE_ROLE_KEY="$SUPABASE_SERVICE_ROLE_KEY" \
+            --env SUPABASE_JWT_SECRET="$SUPABASE_JWT_SECRET" \
+            --env ADMIN_JWT_SECRET="$ADMIN_JWT_SECRET" \
+            --env ADMIN_BOOTSTRAP_USERNAME="$ADMIN_BOOTSTRAP_USERNAME" \
+            --env ADMIN_BOOTSTRAP_PASSWORD="$ADMIN_BOOTSTRAP_PASSWORD" \
+            --env STORAGE_BACKEND="${STORAGE_BACKEND:-minio}" \
+            --env STORAGE_BUCKET="${STORAGE_BUCKET:-faces}" \
+            --env CORS_ORIGINS="$CORS_ORIGINS" \
+            --env FACE_SIMILARITY_THRESHOLD="${FACE_SIMILARITY_THRESHOLD:-0.45}" \
+            --env LEGACY_API_ENABLED="${LEGACY_API_ENABLED:-false}" \
+            --restart unless-stopped \
+            --name be-facemenow "$IMAGE"
+
+          # Loading the face model and running alembic takes a while, so allow ~3 minutes.
+          ok=0
+          i=0
+          while [ "$i" -lt 36 ]; do
+            if curl -fsS http://localhost:7777/health/ready >/dev/null 2>&1; then ok=1; break; fi
+            if [ -z "$(docker ps -q -f name=^be-facemenow$)" ]; then break; fi
+            i=$((i + 1))
+            sleep 5
+          done
+
+          if [ "$ok" = "1" ]; then
+            echo "deploy healthy"
+            docker rm -f be-facemenow-prev 2>/dev/null || true
+            docker image prune -f >/dev/null 2>&1 || true
+          else
+            echo "DEPLOY FAILED - rolling back" >&2
+            docker logs --tail 50 be-facemenow >&2 2>&1 || true
+            docker rm -f be-facemenow || true
+            if [ -n "$(docker ps -aq -f name=^be-facemenow-prev$)" ]; then
+              docker rename be-facemenow-prev be-facemenow
+              docker start be-facemenow
+              echo "rolled back to the previous container" >&2
+            fi
+            exit 1
+          fi
+          REMOTE
+          } | sshpass -e ssh -o StrictHostKeyChecking=no "$DEPLOY_USER@$DEPLOY_SERVER" sh -s

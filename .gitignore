@@ -16,3 +16,6 @@ stripe_backup_code.txt
 .ruff_cache
 uploads/
 *.egg-info
+.env.*
+!.env.example
+*.bak
