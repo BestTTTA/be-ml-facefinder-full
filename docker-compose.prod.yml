@@ -94,7 +94,10 @@ services:
     logging: *logging
     command: server /data --console-address ":9001"
     ports:
-      - "127.0.0.1:${MINIO_PORT:-9100}:9000"
+      # Signed URLs are fetched by the browser, so this has to be an address the
+      # browser can reach — MINIO_PUBLIC_URL must match whatever is bound here.
+      # Keep the loopback default unless a proxy or a private interface fronts it.
+      - "${MINIO_BIND:-127.0.0.1}:${MINIO_PORT:-9100}:9000"
       - "127.0.0.1:${MINIO_CONSOLE_PORT:-9101}:9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?}
