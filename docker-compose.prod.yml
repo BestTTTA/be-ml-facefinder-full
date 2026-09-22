@@ -1,0 +1,118 @@
+# Production stack for the server: pulls the published image instead of building.
+#
+#   cp .env.production.example .env && edit it
+#   docker compose -f docker-compose.prod.yml pull
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# Postgres, Redis and MinIO are bound to 127.0.0.1 so only this host reaches them;
+# put a TLS reverse proxy in front of the api port rather than publishing it directly.
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  api:
+    image: ${DOCKER_IMAGE:?set DOCKER_IMAGE to the published image, e.g. user/facemenow:sha}
+    container_name: be-facemenow
+    restart: unless-stopped
+    logging: *logging
+    ports:
+      - "${API_PORT:-7777}:8000"
+    env_file:
+      - ${API_ENV_FILE:-.env}
+    environment:
+      # In-network addresses always win over .env, which describes the host.
+      DATABASE_URL: postgresql://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_SSL: "false"
+      APP_ENV: production
+      FACE_CTX_ID: ${FACE_CTX_ID:--1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    # The face model is resident per worker; give it room but keep it bounded.
+    mem_limit: ${API_MEM_LIMIT:-4g}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health/live').status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+
+  postgres:
+    # pgvector ships the extension; POSTGRES_USER is a superuser here, so the
+    # migration's CREATE EXTENSION vector succeeds without any manual setup.
+    image: pgvector/pgvector:pg16
+    container_name: facefinder-postgres
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: ${POSTGRES_DB:?}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5555}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    container_name: facefinder-redis
+    restart: unless-stopped
+    logging: *logging
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?}"]
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $${REDIS_PASSWORD} ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+
+  minio:
+    image: ${MINIO_IMAGE:-minio/minio:RELEASE.2023-12-07T04-16-00Z}
+    # The .fips variant is published for amd64 only; this tag is multi-arch.
+    container_name: facefinder-minio
+    restart: unless-stopped
+    logging: *logging
+    command: server /data --console-address ":9001"
+    ports:
+      # Signed URLs are fetched by the browser, so this has to be an address the
+      # browser can reach — MINIO_PUBLIC_URL must match whatever is bound here.
+      # Keep the loopback default unless a proxy or a private interface fronts it.
+      - "${MINIO_BIND:-127.0.0.1}:${MINIO_PORT:-9100}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9101}:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
