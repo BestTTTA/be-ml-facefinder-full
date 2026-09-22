@@ -66,10 +66,16 @@ jobs:
             exit 1
           fi
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          # A key copied on Windows arrives with CRLF endings, and the stray CR
+          # bytes make OpenSSH reject the base64 body with "error in libcrypto".
+          printf '%s\n' "$DEPLOY_SSH_KEY" | tr -d '\r' | sed '/^[[:space:]]*$/d' > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
+          # The markers are not secret, and seeing them rules out a truncated paste.
+          echo "lines: $(wc -l < ~/.ssh/deploy_key)"
+          head -n 1 ~/.ssh/deploy_key
+          tail -n 1 ~/.ssh/deploy_key
           ssh-keygen -y -f ~/.ssh/deploy_key > /dev/null || {
-            echo "::error::DEPLOY_SSH_KEY is not a usable private key — paste the whole file, BEGIN and END lines included"
+            echo "::error::DEPLOY_SSH_KEY is not a usable private key — paste the whole file, BEGIN and END lines included, with one key line per line"
             exit 1
           }
           echo "key loaded"
