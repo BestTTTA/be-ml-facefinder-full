@@ -95,7 +95,14 @@ jobs:
 
           # Everything the deploy needs lives in the repo and in the server's .env,
           # so no application secret has to travel through Actions.
-          sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 -o LogLevel=ERROR "$DEPLOY_USER@$DEPLOY_SERVER" sh -s <<REMOTE
+          # A runner carries its own SSH keys, and offering them first can exhaust
+          # the server's MaxAuthTries before the password is ever tried, so the
+          # password method is the only one left enabled here.
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30"
+          SSH_OPTS="$SSH_OPTS -o PreferredAuthentications=password -o PubkeyAuthentication=no"
+          SSH_OPTS="$SSH_OPTS -o IdentitiesOnly=yes -o NumberOfPasswordPrompts=1"
+
+          sshpass -e ssh $SSH_OPTS "$DEPLOY_USER@$DEPLOY_SERVER" sh -s <<REMOTE
           set -e
           cd "$path"
           git fetch --prune origin
@@ -112,5 +119,8 @@ jobs:
           DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
         run: |
           export SSHPASS="$DEPLOY_PASSWORD"
-          sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 -o LogLevel=ERROR "$DEPLOY_USER@$DEPLOY_SERVER" \
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30"
+          SSH_OPTS="$SSH_OPTS -o PreferredAuthentications=password -o PubkeyAuthentication=no"
+          SSH_OPTS="$SSH_OPTS -o IdentitiesOnly=yes -o NumberOfPasswordPrompts=1"
+          sshpass -e ssh $SSH_OPTS "$DEPLOY_USER@$DEPLOY_SERVER" \
             'docker inspect -f "image={{.Config.Image}} status={{.State.Status}}" be-facemenow 2>/dev/null || echo "container not running"'
