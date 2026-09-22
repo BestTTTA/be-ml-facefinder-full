@@ -58,6 +58,30 @@ jobs:
       - name: Install sshpass
         run: sudo apt-get update && sudo apt-get install -y sshpass
 
+      # Separates "cannot reach the host" from "cannot log in", which the ssh
+      # step alone cannot tell apart.
+      - name: Probe connectivity
+        env:
+          DEPLOY_SERVER: ${{ secrets.DEPLOY_SERVER }}
+        run: |
+          if [ -z "${DEPLOY_SERVER:-}" ]; then
+            echo "::error::the DEPLOY_SERVER secret is empty"
+            exit 1
+          fi
+          echo "target: $DEPLOY_SERVER"
+          tailscale status || true
+          tailscale ping -c 3 "$DEPLOY_SERVER" || true
+          # bash's /dev/tcp avoids depending on nc being present on the runner.
+          for _ in $(seq 1 15); do
+            if (exec 3<>"/dev/tcp/$DEPLOY_SERVER/22") 2>/dev/null; then
+              echo "port 22 is reachable"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::$DEPLOY_SERVER:22 is unreachable from the runner — check the tailnet ACL and the DEPLOY_SERVER value"
+          exit 1
+
       - name: Build and swap on the server
         env:
           DEPLOY_SERVER: ${{ secrets.DEPLOY_SERVER }}
@@ -71,7 +95,7 @@ jobs:
 
           # Everything the deploy needs lives in the repo and in the server's .env,
           # so no application secret has to travel through Actions.
-          sshpass -e ssh -o StrictHostKeyChecking=no "$DEPLOY_USER@$DEPLOY_SERVER" sh -s <<REMOTE
+          sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 -o LogLevel=ERROR "$DEPLOY_USER@$DEPLOY_SERVER" sh -s <<REMOTE
           set -e
           cd "$path"
           git fetch --prune origin
@@ -88,5 +112,5 @@ jobs:
           DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
         run: |
           export SSHPASS="$DEPLOY_PASSWORD"
-          sshpass -e ssh -o StrictHostKeyChecking=no "$DEPLOY_USER@$DEPLOY_SERVER" \
+          sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 -o LogLevel=ERROR "$DEPLOY_USER@$DEPLOY_SERVER" \
             'docker inspect -f "image={{.Config.Image}} status={{.State.Status}}" be-facemenow 2>/dev/null || echo "container not running"'
