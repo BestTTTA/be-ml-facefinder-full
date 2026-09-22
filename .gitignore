@@ -17,5 +17,5 @@ stripe_backup_code.txt
 uploads/
 *.egg-info
 .env.*
-!.env.example
+!.env*.example
 *.bak
