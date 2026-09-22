@@ -57,25 +57,29 @@ jobs:
 
       # A key avoids the whitespace and prompt handling that made password auth
       # fail here, and it can be revoked on the server without changing a login.
+      # The key is carried base64-encoded: a PEM body pasted directly into a secret
+      # kept arriving with its line structure altered, and OpenSSH rejects that with
+      # "error in libcrypto". One base64 line has no whitespace left to damage.
       - name: Install the deploy key
         env:
-          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_SSH_KEY_B64: ${{ secrets.DEPLOY_SSH_KEY_B64 }}
         run: |
-          if [ -z "${DEPLOY_SSH_KEY:-}" ]; then
-            echo "::error::the DEPLOY_SSH_KEY secret is empty"
+          if [ -z "${DEPLOY_SSH_KEY_B64:-}" ]; then
+            echo "::error::the DEPLOY_SSH_KEY_B64 secret is empty"
             exit 1
           fi
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          # A key copied on Windows arrives with CRLF endings, and the stray CR
-          # bytes make OpenSSH reject the base64 body with "error in libcrypto".
-          printf '%s\n' "$DEPLOY_SSH_KEY" | tr -d '\r' | sed '/^[[:space:]]*$/d' > ~/.ssh/deploy_key
+          printf '%s' "$DEPLOY_SSH_KEY_B64" | tr -d ' \t\r\n' | base64 -d > ~/.ssh/deploy_key || {
+            echo "::error::DEPLOY_SSH_KEY_B64 is not valid base64"
+            exit 1
+          }
           chmod 600 ~/.ssh/deploy_key
           # The markers are not secret, and seeing them rules out a truncated paste.
           echo "lines: $(wc -l < ~/.ssh/deploy_key)"
           head -n 1 ~/.ssh/deploy_key
           tail -n 1 ~/.ssh/deploy_key
           ssh-keygen -y -f ~/.ssh/deploy_key > /dev/null || {
-            echo "::error::DEPLOY_SSH_KEY is not a usable private key — paste the whole file, BEGIN and END lines included, with one key line per line"
+            echo "::error::the decoded key is not usable — re-copy the single base64 line exactly"
             exit 1
           }
           echo "key loaded"
