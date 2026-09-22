@@ -55,8 +55,24 @@ jobs:
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
 
-      - name: Install sshpass
-        run: sudo apt-get update && sudo apt-get install -y sshpass
+      # A key avoids the whitespace and prompt handling that made password auth
+      # fail here, and it can be revoked on the server without changing a login.
+      - name: Install the deploy key
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          if [ -z "${DEPLOY_SSH_KEY:-}" ]; then
+            echo "::error::the DEPLOY_SSH_KEY secret is empty"
+            exit 1
+          fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keygen -y -f ~/.ssh/deploy_key > /dev/null || {
+            echo "::error::DEPLOY_SSH_KEY is not a usable private key — paste the whole file, BEGIN and END lines included"
+            exit 1
+          }
+          echo "key loaded"
 
       # Separates "cannot reach the host" from "cannot log in", which the ssh
       # step alone cannot tell apart.
@@ -86,23 +102,18 @@ jobs:
         env:
           DEPLOY_SERVER: ${{ secrets.DEPLOY_SERVER }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-          DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
         run: |
           set -eu
-          export SSHPASS="$DEPLOY_PASSWORD"
           path="${DEPLOY_PATH:-\$HOME/Project/Facefinderr/repo}"
 
           # Everything the deploy needs lives in the repo and in the server's .env,
           # so no application secret has to travel through Actions.
-          # A runner carries its own SSH keys, and offering them first can exhaust
-          # the server's MaxAuthTries before the password is ever tried, so the
-          # password method is the only one left enabled here.
-          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30"
-          SSH_OPTS="$SSH_OPTS -o PreferredAuthentications=password -o PubkeyAuthentication=no"
-          SSH_OPTS="$SSH_OPTS -o IdentitiesOnly=yes -o NumberOfPasswordPrompts=1"
+          SSH_OPTS="-i $HOME/.ssh/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes"
+          SSH_OPTS="$SSH_OPTS -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+          SSH_OPTS="$SSH_OPTS -o ConnectTimeout=30 -o LogLevel=ERROR"
 
-          sshpass -e ssh $SSH_OPTS "$DEPLOY_USER@$DEPLOY_SERVER" sh -s <<REMOTE
+          ssh $SSH_OPTS "$DEPLOY_USER@$DEPLOY_SERVER" sh -s <<REMOTE
           set -e
           cd "$path"
           git fetch --prune origin
@@ -116,11 +127,9 @@ jobs:
         env:
           DEPLOY_SERVER: ${{ secrets.DEPLOY_SERVER }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-          DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
         run: |
-          export SSHPASS="$DEPLOY_PASSWORD"
-          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30"
-          SSH_OPTS="$SSH_OPTS -o PreferredAuthentications=password -o PubkeyAuthentication=no"
-          SSH_OPTS="$SSH_OPTS -o IdentitiesOnly=yes -o NumberOfPasswordPrompts=1"
-          sshpass -e ssh $SSH_OPTS "$DEPLOY_USER@$DEPLOY_SERVER" \
+          SSH_OPTS="-i $HOME/.ssh/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes"
+          SSH_OPTS="$SSH_OPTS -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+          SSH_OPTS="$SSH_OPTS -o ConnectTimeout=30 -o LogLevel=ERROR"
+          ssh $SSH_OPTS "$DEPLOY_USER@$DEPLOY_SERVER" \
             'docker inspect -f "image={{.Config.Image}} status={{.State.Status}}" be-facemenow 2>/dev/null || echo "container not running"'
