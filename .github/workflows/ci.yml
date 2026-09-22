@@ -1,9 +1,9 @@
 name: CI
 
+# Pushes to main are covered by the deploy workflow, which runs the same checks.
 on:
-  push:
-    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -35,7 +35,7 @@ jobs:
       - run: mypy -p app
       - run: alembic upgrade head && alembic check
         env:
-          DATABASE_URL: postgresql://facefinder:facefinder@localhost:5555/facefinder
+          DATABASE_URL: postgresql://facefinder:facefinder@localhost:5555/facefinder_test
       - run: pytest -q
         env:
           TEST_DATABASE_URL: postgresql://facefinder:facefinder@localhost:5555/facefinder_test
