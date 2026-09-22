@@ -33,24 +33,28 @@ echo "deploy: building $IMAGE"
 docker build -t "$IMAGE" .
 
 echo "deploy: starting $IMAGE"
-DOCKER_IMAGE="$IMAGE" docker compose -f "$COMPOSE_FILE" up -d
-
-# The model load and the alembic upgrade both happen at startup, so give it time.
-echo "deploy: waiting for /health/ready on port $API_PORT"
 ok=0
-i=0
-while [ "$i" -lt 60 ]; do
-  if curl -fsS "http://127.0.0.1:${API_PORT}/health/ready" >/dev/null 2>&1; then
-    ok=1
-    break
-  fi
-  if [ -z "$(docker ps -q -f "name=^${CONTAINER}$")" ]; then
-    echo "deploy: container exited" >&2
-    break
-  fi
-  i=$((i + 1))
-  sleep 5
-done
+# `up` itself can fail — an unhealthy dependency, say — and that has to reach the
+# rollback below rather than aborting the script through set -e.
+if DOCKER_IMAGE="$IMAGE" docker compose -f "$COMPOSE_FILE" up -d; then
+  # The model load and the alembic upgrade both happen at startup, so give it time.
+  echo "deploy: waiting for /health/ready on port $API_PORT"
+  i=0
+  while [ "$i" -lt 60 ]; do
+    if curl -fsS "http://127.0.0.1:${API_PORT}/health/ready" >/dev/null 2>&1; then
+      ok=1
+      break
+    fi
+    if [ -z "$(docker ps -q -f "name=^${CONTAINER}$")" ]; then
+      echo "deploy: container exited" >&2
+      break
+    fi
+    i=$((i + 1))
+    sleep 5
+  done
+else
+  echo "deploy: compose up failed" >&2
+fi
 
 if [ "$ok" = "1" ]; then
   echo "deploy: healthy on $IMAGE"
