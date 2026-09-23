@@ -191,10 +191,13 @@ async def user_usage(user_id: uuid.UUID, admin: AdminPrincipal = Depends(require
 @router.get("/users/{user_id}/faces", response_model=SuccessResponse[list],
               responses={**ADMIN_ERRORS, **error_responses(404)}, summary="User faces")
 async def user_faces(user_id: uuid.UUID, limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0),
+                     with_urls: bool = Query(False, description="Include short-lived signed image URLs"),
                      admin: AdminPrincipal = Depends(require_permission(P.FACES_READ)), db: AsyncSession = Depends(get_db)):
     p = await admin_service.get_user(db, user_id)
     rows, total = await admin_service.user_faces(db, p.tenant_id, limit, offset)
-    return ok([await face_service.face_to_dict(f) for f in rows], meta={"total": total, "limit": limit, "offset": offset})
+    storage = get_storage_service() if with_urls else None
+    return ok([await face_service.face_to_dict(f, storage, with_urls) for f in rows],
+              meta={"total": total, "limit": limit, "offset": offset})
 
 
 @router.delete("/users/{user_id}/faces/{face_id}", response_model=SuccessResponse[dict], responses={**ADMIN_ERRORS, **error_responses(404)},
